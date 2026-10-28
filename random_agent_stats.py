@@ -22,32 +22,3 @@ for episode in range(SHOW_EPISODES):
         done = terminated or truncated
 env.close()
 
-# 2. Statistics, without a window (fast)
-env = gym.make("racetrack-v1", config=CONFIG)
-env.action_space.seed(0)
-
-lengths, returns, crashes, off_road = [], [], 0, 0
-for episode in range(EPISODES):
-    env.reset(seed=episode)
-    steps, total, done = 0, 0.0, False
-    while not done:
-        _, reward, terminated, truncated, _ = env.step(env.action_space.sample())
-        steps += 1
-        total += reward
-        done = terminated or truncated
-    lengths.append(steps)
-    returns.append(total)
-    crashes += env.unwrapped.vehicle.crashed
-    off_road += not env.unwrapped.vehicle.on_road
-env.close()
-
-stats = (
-    f"Losowy agent, {EPISODES} epizodów\n"
-    f"średnia długość epizodu: {np.mean(lengths):.1f} kroków (~{np.mean(lengths) / 5:.1f} s)\n"
-    f"średni zwrot: {np.mean(returns):.2f} (± {np.std(returns):.2f})\n"
-    f"wyjazd z drogi: {off_road / EPISODES:.0%}\n"
-    f"kolizja: {crashes / EPISODES:.0%}\n"
-)
-print(stats)
-with open("random_agent_stats.txt", "w", encoding="utf-8") as f:
-    f.write(stats)
