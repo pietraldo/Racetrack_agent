@@ -1,0 +1,1 @@
+1. Action type: continous actions, throtle and steering angle

@@ -78,15 +78,9 @@ def show_obs(observations):
 
 
 # Arrow keys: UP/DOWN = accelerate/brake, LEFT/RIGHT = steer
-env = gymnasium.make('racetrack-large-v1', render_mode='rgb_array', 
-                     config={
-        "observation": {
-            "type": "LidarObservation",
-            "cells": 128,
-        },
+env = gymnasium.make('racetrack-v1', render_mode='rgb_array', config={
     
-    }
-)
+})
 obs, info = env.reset()
 
 
@@ -108,16 +102,13 @@ while running:
     plt_array.append(env.render())
     obs_array.append(obs.copy())
 
-    if terminated or truncated:
+    if terminated:
         obs, info = env.reset()
         break
 env.close()
 
 # Keep widget references alive so the sliders and buttons stay interactive
-#widgets = show_frames(plt_array) + show_obs(obs_array)
-#plt.show()
+widgets = show_frames(plt_array) + show_obs(obs_array)
+plt.show()
 print(obs_array[0])
 
-# jak to jest z tym rewardem? czemu srodowisko daje a nie ja jak trenuje?
-# ktore akcje ja mam? czy one zaleza od srodowiska?
-# gdzie jest ten model

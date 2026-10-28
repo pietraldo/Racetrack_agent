@@ -1,0 +1,5 @@
+Losowy agent, 100 epizodów
+średnia długość epizodu: 11.5 kroków (~2.3 s)
+średni zwrot: 5.73 (± 6.67)
+wyjazd z drogi: 99%
+kolizja: 1%
