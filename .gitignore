@@ -1,2 +1,5 @@
 .venv
 sac_logs
+__pycache__
+sac_checkpoints
+sac_learning_curve.png    
