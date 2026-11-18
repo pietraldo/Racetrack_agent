@@ -1,5 +1,6 @@
 import glob
 import io
+import sys
 import gymnasium as gym
 import highway_env  # registers racetrack envs
 import matplotlib.pyplot as plt
@@ -10,21 +11,23 @@ from highway_env.vehicle.behavior import IDMVehicle
 import numpy as np
 import pandas as pd
 import torch
-from stable_baselines3 import SAC
+# from stable_baselines3 import SAC
+from softactorcritic import SAC
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.monitor import Monitor
 
 # Trains SAC on racetrack-v1 in stages (curriculum), saves the model and plots learning statistics
 
 TIMESTEPS = 600_000
 N_ENVS = 8  # number of envs simulated in parallel processes
-SAVE_FREQ = 10_000  # how often (in timesteps) a new checkpoint is saved (~6 MB each), watch_agent.py shows the newest
+SAVE_FREQ = 100 #10_000  # how often (in timesteps) a new checkpoint is saved (~6 MB each), watch_agent.py shows the newest
 CHECKPOINT_DIR = "sac_checkpoints"
 STAGE_FILE = "sac_checkpoints/stage.txt"  # current stage, read by watch_agent.py
 # Path to a saved model to continue training, e.g. "sac_checkpoints/model_000158000.zip"; None = train from scratch.
 # Models trained before the observation got speed and steering added cannot be loaded.
-RESUME_FROM = "sac_checkpoints/latest.zip"
+RESUME_FROM = None#"sac_checkpoints/latest.zip"
 START_STAGE = 2  # stage to start from (useful together with RESUME_FROM)
 
 CONFIG = {
@@ -237,9 +240,11 @@ if __name__ == "__main__":
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     # N_ENVS copies of the env, each in its own process
-    env = make_vec_env(make_env, n_envs=N_ENVS, env_kwargs={"stage": START_STAGE}, vec_env_cls=SubprocVecEnv)
+    # env = make_vec_env(make_env, n_envs=N_ENVS, env_kwargs={"stage": START_STAGE}, vec_env_cls=SubprocVecEnv)
+    env = make_env(stage=START_STAGE)
     # VecMonitor writes reward and length of every episode to sac_logs/monitor.csv
-    env = VecMonitor(env, "sac_logs/")
+    # env = VecMonitor(env, "sac_logs/")
+    env = Monitor(env, "sac_logs/")
 
     # verbose=1 prints a table with stats (mean reward, episode length, losses) during training
     if RESUME_FROM:
@@ -248,7 +253,8 @@ if __name__ == "__main__":
     else:
         model = SAC("MlpPolicy", env, verbose=1, tensorboard_log="sac_logs/")
     # reset_num_timesteps=False keeps counting timesteps from the loaded model; TIMESTEPS more are trained
-    callbacks = [SaveCheckpoint(SAVE_FREQ), Curriculum(START_STAGE)]
+    # callbacks = [SaveCheckpoint(SAVE_FREQ), Curriculum(START_STAGE)]
+    callbacks: list[BaseCallback] = [SaveCheckpoint(SAVE_FREQ)]
     model.learn(total_timesteps=TIMESTEPS, callback=callbacks, reset_num_timesteps=False)
     model.save(checkpoint_path(model.num_timesteps))
     model.save("sac_racetrack")  # copy of the final model for random_agent_stats.py
