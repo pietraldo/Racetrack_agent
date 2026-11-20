@@ -1,34 +1,28 @@
-import glob
-import io
-import sys
+import argparse
+import csv
+import json
+import os
+import random
+import time
+from collections import deque
+
 import gymnasium as gym
 import highway_env  # registers racetrack envs
-import matplotlib.pyplot as plt
-import os
-from collections import deque
-from highway_env.vehicle.behavior import IDMVehicle
-
 import numpy as np
-import pandas as pd
 import torch
-# from stable_baselines3 import SAC
-from softactorcritic import SAC
+from highway_env.vehicle.behavior import IDMVehicle
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
-from stable_baselines3.common.monitor import Monitor
 
-# Trains SAC on racetrack-v1 in stages (curriculum), saves the model and plots learning statistics
+from softactorcritic import SAC
 
-TIMESTEPS = 600_000
-N_ENVS = 8  # number of envs simulated in parallel processes
-SAVE_FREQ = 100 #10_000  # how often (in timesteps) a new checkpoint is saved (~6 MB each), watch_agent.py shows the newest
-CHECKPOINT_DIR = "sac_checkpoints"
-STAGE_FILE = "sac_checkpoints/stage.txt"  # current stage, read by watch_agent.py
-# Path to a saved model to continue training, e.g. "sac_checkpoints/model_000158000.zip"; None = train from scratch.
-# Models trained before the observation got speed and steering added cannot be loaded.
-RESUME_FROM = None#"sac_checkpoints/latest.zip"
-START_STAGE = 2  # stage to start from (useful together with RESUME_FROM)
+# Trains our own SAC (softactorcritic/) on racetrack-v1 in stages (curriculum).
+# Every run goes to runs/<name>/: config.json, episodes.csv (every training episode), eval.csv (periodic
+# deterministic evaluation), curriculum.csv, checkpoints/. Plots: plot_training.py, evaluation: evaluate.py.
+#
+# Examples:
+#   python train_sac.py --name curriculum_a0.2                      # empty -> one car -> light traffic
+#   python train_sac.py --name no_curriculum --start-stage 2        # straight to light traffic
+#   python train_sac.py --name curriculum_a0.05 --alpha 0.05
 
 CONFIG = {
     "action": {
@@ -60,16 +54,17 @@ IDLE_STEPS = 25  # standing for this many steps (5 s) ends the episode with CRAS
 # Curriculum: the next stage starts when the mean length of the last ADVANCE_EPISODES episodes
 # is at least ADVANCE_LENGTH of the max length (the car stops crashing), or after max_timesteps in the stage
 # "vehicles": (min, max) other cars, the number is drawn uniformly every episode
+# max_timesteps are for a single env (our SAC collects one transition per step)
 STAGES = [
-    {"name": "empty track", "vehicles": (0, 0), "max_timesteps": 100_000},
-    {"name": "one car", "vehicles": (1, 1), "max_timesteps": 100_000},
-    {"name": "light traffic", "vehicles": (1, 5), "max_timesteps": 150_000},
-    {"name": "heavy traffic", "vehicles": (10, 20), "max_timesteps": None},  # last stage runs until TIMESTEPS
+    {"name": "empty track", "vehicles": (0, 0), "max_timesteps": 50_000},
+    {"name": "one car", "vehicles": (1, 1), "max_timesteps": 30_000},
+    {"name": "light traffic", "vehicles": (1, 5), "max_timesteps": None},
+    {"name": "heavy traffic", "vehicles": (10, 20), "max_timesteps": None},
 ]
 VEHICLE_SPACING = 12  # m, min distance between spawned cars (env uses 20 m, which fits only ~12 cars)
 EGO_SPACING = 20  # m, min distance between a spawned car and the agent
 ADVANCE_LENGTH = 0.8
-ADVANCE_EPISODES = 50
+ADVANCE_EPISODES = 30
 EASY_EPISODE_PROB = 0.2  # share of episodes played on the previous stage, so the agent does not forget it
 
 
@@ -155,122 +150,184 @@ def make_env(render_mode=None, stage=0):
     return RacetrackWrapper(env, stage)
 
 
-# torch fails to read the weights directly from the file inside SB3's zip ("PytorchStreamReader failed"),
-# so they are read into memory first. Applies to every SAC.load in this file and in files importing it.
-_torch_load = torch.load
-torch.load = lambda f, *args, **kwargs: _torch_load(io.BytesIO(f.read()) if hasattr(f, "read") else f, *args, **kwargs)
+def episode_outcome(info, terminated):
+    return "idle" if info.get("idle") else "crash" if terminated else "timeout"
 
 
-def checkpoint_path(timesteps):
-    return f"{CHECKPOINT_DIR}/model_{timesteps:09d}.zip"  # zero padding keeps files sorted by timesteps
+class EpisodeLogger(gym.Wrapper):
+    """Collects per-episode statistics of the training env (return, length, outcome, mean forward speed)."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.episodes = []  # finished episodes, read by TrainingCallback
+        self._ret, self._len, self._speed = 0.0, 0, 0.0
+
+    def reset(self, **kwargs):
+        self._ret, self._len, self._speed = 0.0, 0, 0.0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._ret += reward
+        self._len += 1
+        self._speed += info["forward_speed"]
+        if terminated or truncated:
+            self.episodes.append({
+                "return": self._ret,
+                "length": self._len,
+                "outcome": episode_outcome(info, terminated),
+                "forward_speed": self._speed / self._len * MAX_SPEED,  # m/s along the track
+            })
+        return obs, reward, terminated, truncated, info
 
 
-def newest_checkpoint():
-    checkpoints = sorted(glob.glob(f"{CHECKPOINT_DIR}/model_*.zip"))
-    return checkpoints[-1] if checkpoints else None
-
-
-def read_stage():
-    try:
-        with open(STAGE_FILE) as f:
-            return int(f.read())
-    except (OSError, ValueError):
-        return 0
-
-
-def write_stage(stage):
-    with open(STAGE_FILE, "w") as f:
-        f.write(str(stage))
-
-
-class SaveCheckpoint(BaseCallback):
-    """Every save_freq timesteps saves the model to a new file, existing files are never overwritten."""
-
-    def __init__(self, save_freq):
-        super().__init__()
-        self.save_freq = save_freq
-
-    def _on_training_start(self):
-        self.last_save = self.num_timesteps
-
-    def _on_step(self):
-        if self.num_timesteps - self.last_save >= self.save_freq:
-            self.last_save = self.num_timesteps
-            self.model.save(checkpoint_path(self.num_timesteps))
-        return True
-
-
-class Curriculum(BaseCallback):
-    """Moves all envs to the next stage when the agent masters the current one."""
-
-    def __init__(self, stage):
-        super().__init__()
-        self.stage = stage
-        self.lengths = deque(maxlen=ADVANCE_EPISODES)
-
-    def _on_training_start(self):
-        self.stage_start = self.num_timesteps
-        write_stage(self.stage)
-
-    def _on_step(self):
-        for info in self.locals["infos"]:
-            if "episode" in info:  # added by VecMonitor when an episode ends
-                self.lengths.append(info["episode"]["l"])
-        self.logger.record("curriculum/stage", self.stage)
-
-        if self.stage == len(STAGES) - 1:
-            return True
-        mastered = (
-            len(self.lengths) == ADVANCE_EPISODES and np.mean(self.lengths) >= ADVANCE_LENGTH * EPISODE_STEPS
-        )
-        max_timesteps = STAGES[self.stage]["max_timesteps"]
-        if mastered or self.num_timesteps - self.stage_start >= max_timesteps:
-            self.stage += 1
-            self.stage_start = self.num_timesteps
-            self.lengths.clear()
-            self.training_env.env_method("set_stage", self.stage)
-            write_stage(self.stage)
-            reason = "mastered" if mastered else "time limit"
-            print(f"\n=== Stage {self.stage}: {STAGES[self.stage]['name']} ({reason}) at {self.num_timesteps} ===\n")
-        return True
-
-
-# Subprocesses re-import this file on Windows, so training must be under the main guard
-if __name__ == "__main__":
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-    # N_ENVS copies of the env, each in its own process
-    # env = make_vec_env(make_env, n_envs=N_ENVS, env_kwargs={"stage": START_STAGE}, vec_env_cls=SubprocVecEnv)
-    env = make_env(stage=START_STAGE)
-    # VecMonitor writes reward and length of every episode to sac_logs/monitor.csv
-    # env = VecMonitor(env, "sac_logs/")
-    env = Monitor(env, "sac_logs/")
-
-    # verbose=1 prints a table with stats (mean reward, episode length, losses) during training
-    if RESUME_FROM:
-        model = SAC.load(RESUME_FROM, env=env, verbose=1, tensorboard_log="sac_logs/")
-        print(f"Resuming from {RESUME_FROM} ({model.num_timesteps} timesteps already trained)")
-    else:
-        model = SAC("MlpPolicy", env, verbose=1, tensorboard_log="sac_logs/")
-    # reset_num_timesteps=False keeps counting timesteps from the loaded model; TIMESTEPS more are trained
-    # callbacks = [SaveCheckpoint(SAVE_FREQ), Curriculum(START_STAGE)]
-    callbacks: list[BaseCallback] = [SaveCheckpoint(SAVE_FREQ)]
-    model.learn(total_timesteps=TIMESTEPS, callback=callbacks, reset_num_timesteps=False)
-    model.save(checkpoint_path(model.num_timesteps))
-    model.save("sac_racetrack")  # copy of the final model for random_agent_stats.py
+def evaluate(model, stage, episodes, seed):
+    """Deterministic policy on a fresh env with fixed seeds; returns mean statistics."""
+    env = make_env(stage=stage)
+    env.easy_episode_prob = 0
+    results = []
+    for i in range(episodes):
+        obs, _ = env.reset(seed=seed + i)
+        ret, length, speed, done = 0.0, 0, 0.0, False
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            ret += reward
+            length += 1
+            speed += info["forward_speed"]
+            done = terminated or truncated
+        results.append({
+            "return": ret,
+            "length": length,
+            "outcome": episode_outcome(info, terminated),
+            "forward_speed": speed / length * MAX_SPEED,
+        })
     env.close()
+    return results
 
-    # Learning curves from monitor.csv
-    log = pd.read_csv("sac_logs/monitor.csv", skiprows=1)  # first line is a comment
-    fig, (ax_reward, ax_length) = plt.subplots(2, 1, sharex=True)
-    ax_reward.plot(log["r"], alpha=0.3, label="episode")
-    ax_reward.plot(log["r"].rolling(20).mean(), label="mean of last 20")
-    ax_reward.set_ylabel("reward")
-    ax_reward.legend()
-    ax_length.plot(log["l"], alpha=0.3)
-    ax_length.plot(log["l"].rolling(20).mean())
-    ax_length.set_ylabel("episode length")
-    ax_length.set_xlabel("episode")
-    fig.suptitle("SAC on racetrack-v1")
-    fig.savefig("sac_learning_curve.png")
-    plt.show()
+
+class TrainingCallback(BaseCallback):
+    """Called by our SAC after every env step: logs episodes, runs the curriculum, evaluates and saves checkpoints."""
+
+    def __init__(self, model, env, run_dir, stage, final_stage, eval_freq, eval_episodes, save_freq, total):
+        super().__init__()
+        self.sac, self.env, self.run_dir = model, env, run_dir
+        self.stage, self.final_stage = stage, final_stage
+        self.eval_freq, self.eval_episodes, self.save_freq, self.total = eval_freq, eval_episodes, save_freq, total
+        self.steps = 0
+        self.stage_start = 0
+        self.logged_episodes = 0
+        self.lengths = deque(maxlen=ADVANCE_EPISODES)
+        self.start_time = time.time()
+        self.episodes_file = open(f"{run_dir}/episodes.csv", "w", newline="")
+        self.episodes_csv = csv.writer(self.episodes_file)
+        self.episodes_csv.writerow(["episode", "timesteps", "stage", "return", "length", "outcome", "forward_speed"])
+        self.eval_file = open(f"{run_dir}/eval.csv", "w", newline="")
+        self.eval_csv = csv.writer(self.eval_file)
+        self.eval_csv.writerow(["timesteps", "stage", "return_mean", "return_std", "length_mean", "success_rate",
+                                "crash_rate", "forward_speed"])
+        self.curriculum_file = open(f"{run_dir}/curriculum.csv", "w", newline="")
+        self.curriculum_csv = csv.writer(self.curriculum_file)
+        self.curriculum_csv.writerow(["timesteps", "stage", "name", "reason"])
+        self.curriculum_csv.writerow([0, stage, STAGES[stage]["name"], "start"])
+        self.curriculum_file.flush()
+        self._write_stage()
+
+    def _write_stage(self):
+        with open(f"{self.run_dir}/stage.txt", "w") as f:
+            f.write(str(self.stage))
+
+    def _on_step(self):
+        self.steps += 1
+        while self.logged_episodes < len(self.env.episodes):
+            ep = self.env.episodes[self.logged_episodes]
+            self.logged_episodes += 1
+            self.lengths.append(ep["length"])
+            self.episodes_csv.writerow([self.logged_episodes, self.steps, self.stage, f"{ep['return']:.3f}",
+                                        ep["length"], ep["outcome"], f"{ep['forward_speed']:.3f}"])
+        self._curriculum()
+        if self.steps % self.eval_freq == 0 or self.steps == self.total:
+            self._evaluate()
+        if self.steps % self.save_freq == 0:
+            self.sac.save(f"{self.run_dir}/checkpoints/model_{self.steps:09d}.pkl")
+        return True
+
+    def _curriculum(self):
+        if self.stage >= self.final_stage:
+            return
+        mastered = len(self.lengths) == ADVANCE_EPISODES and np.mean(self.lengths) >= ADVANCE_LENGTH * EPISODE_STEPS
+        max_timesteps = STAGES[self.stage]["max_timesteps"]
+        if mastered or (max_timesteps and self.steps - self.stage_start >= max_timesteps):
+            self.stage += 1
+            self.stage_start = self.steps
+            self.lengths.clear()
+            self.env.unwrapped_wrapper.set_stage(self.stage)
+            self._write_stage()
+            reason = "mastered" if mastered else "time limit"
+            self.curriculum_csv.writerow([self.steps, self.stage, STAGES[self.stage]["name"], reason])
+            self.curriculum_file.flush()
+            print(f"=== Stage {self.stage}: {STAGES[self.stage]['name']} ({reason}) at {self.steps} ===", flush=True)
+
+    def _evaluate(self):
+        # Always evaluated on the final (target) stage, so curves of different runs are comparable
+        results = evaluate(self.sac, self.final_stage, self.eval_episodes, seed=10_000)
+        returns = [r["return"] for r in results]
+        success = np.mean([r["outcome"] == "timeout" for r in results])
+        crash = np.mean([r["outcome"] == "crash" for r in results])
+        self.eval_csv.writerow([self.steps, self.stage, f"{np.mean(returns):.3f}", f"{np.std(returns):.3f}",
+                                f"{np.mean([r['length'] for r in results]):.1f}", f"{success:.3f}", f"{crash:.3f}",
+                                f"{np.mean([r['forward_speed'] for r in results]):.3f}"])
+        self.eval_file.flush()
+        self.episodes_file.flush()
+        recent = [e["return"] for e in self.env.episodes[-20:]]
+        elapsed = time.time() - self.start_time
+        print(f"[{self.steps}/{self.total}] stage {self.stage} | train return (last 20) {np.mean(recent) if recent else 0:.1f}"
+              f" | eval return {np.mean(returns):.1f}, success {success:.0%} | {self.steps / elapsed:.0f} steps/s",
+              flush=True)
+
+    def _on_training_end(self):
+        for f in (self.episodes_file, self.eval_file, self.curriculum_file):
+            f.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", required=True, help="run name, output goes to runs/<name>/")
+    parser.add_argument("--timesteps", type=int, default=80_000)
+    parser.add_argument("--start-stage", type=int, default=0)
+    parser.add_argument("--final-stage", type=int, default=2, help="curriculum stops here (2 = light traffic)")
+    parser.add_argument("--alpha", type=float, default=0.2, help="entropy coefficient")
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--learning-starts", type=int, default=1000)
+    parser.add_argument("--eval-freq", type=int, default=5000)
+    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--save-freq", type=int, default=10_000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=2, help="torch CPU threads")
+    args = parser.parse_args()
+
+    run_dir = f"runs/{args.name}"
+    os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+    torch.set_num_threads(args.threads)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    with open(f"{run_dir}/config.json", "w") as f:
+        json.dump({"args": vars(args), "env_config": CONFIG, "stages": STAGES, "advance_length": ADVANCE_LENGTH,
+                   "advance_episodes": ADVANCE_EPISODES, "easy_episode_prob": EASY_EPISODE_PROB,
+                   "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f, indent=2, default=str)
+
+    wrapper = make_env(stage=args.start_stage)
+    env = EpisodeLogger(wrapper)
+    env.unwrapped_wrapper = wrapper  # used by the curriculum to switch stages
+    env.reset(seed=args.seed)
+
+    model = SAC("MlpPolicy", env, learning_rate=args.lr, batch_size=args.batch_size,
+                learning_starts=args.learning_starts, ent_coef=args.alpha, seed=args.seed)
+    callback = TrainingCallback(model, env, run_dir, args.start_stage, args.final_stage, args.eval_freq,
+                                args.eval_episodes, args.save_freq, args.timesteps)
+    model.learn(total_timesteps=args.timesteps, callback=callback)
+    model.save(f"{run_dir}/final_model.pkl")
+    env.close()
+    print(f"Done, model saved to {run_dir}/final_model.pkl")

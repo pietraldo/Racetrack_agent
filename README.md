@@ -62,14 +62,20 @@ uv run python main.py
 # baseline – losowy agent (GIF + statystyki)
 uv run python random_agent.py
 
-# trening SAC
-uv run python train_sac.py
+# trening naszego SAC (softactorcritic/) – wyniki w runs/<nazwa>/
+python train_sac.py --name A_curriculum_a0.2                     # pusty tor -> 1 auto -> lekki ruch
+python train_sac.py --name C_no_curriculum_a0.2 --start-stage 2  # od razu lekki ruch
+python train_sac.py --name B_curriculum_a0.05 --alpha 0.05       # inny współczynnik entropii
 
-# podgląd agenta na żywo (w drugim terminalu)
-uv run python watch_agent.py
+# podgląd agenta na żywo (w drugim terminalu), domyślnie najnowszy run
+python watch_agent.py runs/A_curriculum_a0.2
 
-# wykresy treningu
-uv run tensorboard --logdir sac_logs
+# krzywe uczenia -> figures/learning_*.png, figures/compare_*.png
+python plot_training.py
+
+# ewaluacja końcowa (wszystkie runs/*/final_model.pkl + agent losowy, 4 poziomy ruchu, 30 ep.)
+# -> results/eval_summary.md, figures/eval_*.png
+python evaluate.py
 ```
 
 **Trening od zera:** ustaw w `train_sac.py` `RESUME_FROM = None` i `START_STAGE = 0`

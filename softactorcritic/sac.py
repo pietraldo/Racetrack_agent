@@ -109,7 +109,8 @@ class SAC:
         self.verbose = verbose
         self.tensorboard_log = tensorboard_log
 
-        self.alpha = 0.2
+        # Fixed entropy coefficient; a float ent_coef overrides the default 0.2 ('auto' tuning is not implemented)
+        self.alpha = float(ent_coef) if not isinstance(ent_coef, str) else 0.2
         actor_arch = actor_arch if actor_arch else [256, 256]
         critic_arch = critic_arch if critic_arch else [256, 256]
 
@@ -241,6 +242,21 @@ class SAC:
             
             action = self._scale_action(action).detach().numpy()
             return action, None
+
+    def __getstate__(self):
+        # The env and the replay buffer are not saved; the target critic is stored as a state_dict,
+        # because AveragedModel holds a local function that pickle cannot serialize
+        state = self.__dict__.copy()
+        state["env"] = None
+        state["replay_buffer"] = deque([], maxlen=self.buffer_size)
+        state["critic_target"] = self.critic_target.state_dict()
+        return state
+
+    def __setstate__(self, state):
+        target_state = state.pop("critic_target")
+        self.__dict__.update(state)
+        self.critic_target = AveragedModel(self.critic, multi_avg_fn=get_ema_multi_avg_fn(1 - self.tau))
+        self.critic_target.load_state_dict(target_state)
 
     def save(self, path):
         with open(path, "wb") as f:
