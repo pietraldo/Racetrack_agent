@@ -52,7 +52,7 @@ class ReplayBuffer:
         assert obs.shape[0] == actions.shape[0] == rewards.shape[0] == \
             next_obs.shape[0] == dones.shape[0]
 
-        num_append = self.capacity - self.index
+        num_append = min(self.capacity - self.index, obs.shape[0])
         num_overflow = obs.shape[0] - num_append
 
         self.obs[self.index:self.index+num_append] = obs[:num_append]

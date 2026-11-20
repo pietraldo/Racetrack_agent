@@ -1,65 +1,26 @@
 import pickle
 import random
 from collections import deque
+from typing import cast
 
 import gymnasium as gym
 import numpy as np
 import torch as th
 import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import VecEnv
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from softactorcritic.buffer import ReplayBuffer
 from softactorcritic.models import Actor, Critic
+from softactorcritic.scheduler import Scheduler
 
-
-class Scheduler:
-    def __init__(
-        self,
-        learning_starts,
-        train_freq,
-        target_update_interval,
-        log_interval = None
-    ):
-        self.learning_starts = learning_starts
-        self.train_freq = train_freq
-        self.target_update_interval = target_update_interval
-        self.log_interval = log_interval
-
-        self.learning_started = False
-        self.steps = 0
-        self.grad_steps = 0
-
-    def did_step(self):
-        self.steps += 1
-        if not self.learning_started and self.steps >= self.learning_starts:
-             self.learning_started = True
-
-    def did_grad_step(self):
-        self.grad_steps += 1
-
-    def should_train(self):
-        return (
-            self.learning_started and
-            self.steps % self.train_freq == 0
-        ) 
-    
-    def should_train_target(self):
-         return self.grad_steps % self.target_update_interval == 0
-    
-    def should_log(self):
-        return self.log_interval and self.steps % self.log_interval == 0
-        
-    def reset(self):
-        self.learning_started = False
-        self.steps = 0
-        self.grad_steps = 0
 
 class SAC:
     def __init__(
             self,
             policy: str,
-            env: gym.Env, 
+            env: VecEnv, 
             learning_rate=0.0003, 
             buffer_size=1000000, 
             learning_starts=100, 
@@ -147,20 +108,20 @@ class SAC:
         )
 
     def _scale_action(self, a):
-        low_bound = th.Tensor(self.env.action_space.low)
-        high_bound = th.Tensor(self.env.action_space.high)
-        return th.lerp(low_bound, high_bound, (a + 1.0) * 0.5)
+        low_bound = self.env.action_space.low
+        high_bound = self.env.action_space.high
+        return low_bound + (a + 1.0) * 0.5 * (high_bound - low_bound)
 
     def train(self, gradient_steps, batch_size=64):
         for _ in range(gradient_steps):
             batch_size = min(batch_size, self.replay_buffer.size())
             obs, actions, rewards, new_obs, dones = self.replay_buffer.sample(batch_size)
 
-            obs = th.as_tensor(obs,      dtype=th.float32)
-            actions = th.as_tensor(actions,  dtype=th.float32)
-            new_obs = th.as_tensor(new_obs,  dtype=th.float32)
+            obs = th.as_tensor(obs, dtype=th.float32)
+            actions = th.as_tensor(actions, dtype=th.float32)
+            new_obs = th.as_tensor(new_obs, dtype=th.float32)
             rewards = th.as_tensor(rewards, dtype=th.float32).unsqueeze(-1)
-            dones = th.as_tensor(dones,   dtype=th.float32).unsqueeze(-1)
+            dones = th.as_tensor(dones, dtype=th.float32).unsqueeze(-1)
             
             # Crtitic gradient step
             with th.no_grad():
@@ -193,7 +154,7 @@ class SAC:
     def learn(
         self, 
         total_timesteps: int, 
-        log_interval: int = 0, 
+        log_interval: int | None = None, 
         callback: BaseCallback | list[BaseCallback] | None = None,
         reset_num_timesteps: bool = True,
     ):
@@ -210,20 +171,21 @@ class SAC:
         [c._on_training_start() for c in callback]
         [c._on_rollout_start() for c in callback]
 
-        obs, _ = self.env.reset()
+        obs: np.ndarray = self.env.reset() # type: ignore
         for _ in range(total_timesteps):
             with th.no_grad():
-                action = self.actor(th.as_tensor(obs)).detach()
-                scaled_action = self._scale_action(action).numpy()
-            new_obs, reward, terminated, truncated, _ = self.env.step(scaled_action)
+                actions = self.actor(th.as_tensor(obs)).detach().numpy()
+            scaled_actions = self._scale_action(actions)
+            new_obs, rewards, dones, _ = self.env.step(scaled_actions)
+            new_obs = cast(np.ndarray, new_obs)
             [c._on_step() for c in callback]
             
-            self.replay_buffer.append(obs, action, float(reward), new_obs, terminated)
+            self.replay_buffer.extend(obs, actions, rewards, new_obs, dones)
 
-            if terminated or truncated:
-                obs, _ = self.env.reset()
-            else:
-                obs = new_obs
+            # if terminated or truncated:
+            #     obs, _ = self.env.reset()
+            # else:
+            obs = new_obs # type: ignore
 
             if self.scheduler.should_train():
                 [c._on_rollout_end() for c in callback]
@@ -233,7 +195,7 @@ class SAC:
             if self.scheduler.should_log():
                 print(f'Step: {self.scheduler.steps}')
 
-            self.scheduler.did_step()
+            self.scheduler.did_step(new_obs.shape[0])
 
         [c._on_training_end() for c in callback]
     
@@ -244,7 +206,7 @@ class SAC:
             else:
                 action = self.actor.forward(th.as_tensor(observation))
             
-            action = self._scale_action(action).detach().numpy()
+            action = self._scale_action(action.detach().numpy())
             return action, None
 
     def __getstate__(self):

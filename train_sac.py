@@ -7,11 +7,13 @@ import time
 from collections import deque
 
 import gymnasium as gym
-import highway_env  # registers racetrack envs
+import highway_env  # noqa: F401 registers racetrack envs
 import numpy as np
 import torch
 from highway_env.vehicle.behavior import IDMVehicle
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnvWrapper
 
 from softactorcritic import SAC
 
@@ -40,6 +42,7 @@ CONFIG = {
 }
 MAX_SPEED = CONFIG["action"]["speed_range"][1]
 EPISODE_STEPS = CONFIG["duration"] * CONFIG["policy_frequency"]
+N_ENVS = 8  # number of envs simulated in parallel processes
 
 # Reward, replaces the env's own reward (which paid ~0.5 per step just for surviving, so standing still was optimal)
 SPEED_REWARD = 1.0  # per step at max speed along the track
@@ -54,7 +57,7 @@ IDLE_STEPS = 25  # standing for this many steps (5 s) ends the episode with CRAS
 # Curriculum: the next stage starts when the mean length of the last ADVANCE_EPISODES episodes
 # is at least ADVANCE_LENGTH of the max length (the car stops crashing), or after max_timesteps in the stage
 # "vehicles": (min, max) other cars, the number is drawn uniformly every episode
-# max_timesteps are for a single env (our SAC collects one transition per step)
+# max_timesteps count steps summed over all N_ENVS envs (like SB3's num_timesteps)
 STAGES = [
     {"name": "empty track", "vehicles": (0, 0), "max_timesteps": 50_000},
     {"name": "one car", "vehicles": (1, 1), "max_timesteps": 30_000},
@@ -145,61 +148,75 @@ class RacetrackWrapper(gym.Wrapper):
         return self._observation(obs), reward, terminated, truncated, info
 
 
-def make_env(render_mode=None, stage=0):
+def make_env(render_mode=None, stage=0, easy_episode_prob=EASY_EPISODE_PROB):
     env = gym.make("racetrack-v1", render_mode=render_mode, config=CONFIG)
-    return RacetrackWrapper(env, stage)
+    env = RacetrackWrapper(env, stage)
+    env.easy_episode_prob = easy_episode_prob
+    return env
+
+
+def is_terminated(info):
+    """SB3 VecEnvs auto-reset and merge terminated/truncated into `done`; truncation is flagged in info."""
+    return not info.get("TimeLimit.truncated", False)
 
 
 def episode_outcome(info, terminated):
     return "idle" if info.get("idle") else "crash" if terminated else "timeout"
 
 
-class EpisodeLogger(gym.Wrapper):
-    """Collects per-episode statistics of the training env (return, length, outcome, mean forward speed)."""
+class EpisodeLogger(VecEnvWrapper):
+    """Collects per-episode statistics of the training VecEnv (return, length, outcome, mean forward speed)."""
 
-    def __init__(self, env):
-        super().__init__(env)
-        self.episodes = []  # finished episodes, read by TrainingCallback
-        self._ret, self._len, self._speed = 0.0, 0, 0.0
+    def __init__(self, venv):
+        super().__init__(venv)
+        self.episodes = []  # finished episodes (from all envs, in order of completion), read by TrainingCallback
+        self._reset_stats()
 
-    def reset(self, **kwargs):
-        self._ret, self._len, self._speed = 0.0, 0, 0.0
-        return self.env.reset(**kwargs)
+    def _reset_stats(self):
+        n = self.num_envs
+        self._ret, self._len, self._speed = np.zeros(n), np.zeros(n, dtype=int), np.zeros(n)
 
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._ret += reward
+    def reset(self):
+        self._reset_stats()
+        return self.venv.reset()
+
+    def step_wait(self):
+        obs, rewards, dones, infos = self.venv.step_wait()
+        self._ret += rewards
         self._len += 1
-        self._speed += info["forward_speed"]
-        if terminated or truncated:
+        self._speed += [info["forward_speed"] for info in infos]
+        for i in np.flatnonzero(dones):  # obs[i] is already the first observation of the next episode
             self.episodes.append({
-                "return": self._ret,
-                "length": self._len,
-                "outcome": episode_outcome(info, terminated),
-                "forward_speed": self._speed / self._len * MAX_SPEED,  # m/s along the track
+                "return": float(self._ret[i]),
+                "length": int(self._len[i]),
+                "outcome": episode_outcome(infos[i], is_terminated(infos[i])),
+                "forward_speed": float(self._speed[i] / self._len[i] * MAX_SPEED),  # m/s along the track
             })
-        return obs, reward, terminated, truncated, info
+            self._ret[i], self._len[i], self._speed[i] = 0.0, 0, 0.0
+        return obs, rewards, dones, infos
 
 
 def evaluate(model, stage, episodes, seed):
-    """Deterministic policy on a fresh env with fixed seeds; returns mean statistics."""
-    env = make_env(stage=stage)
-    env.easy_episode_prob = 0
+    """Deterministic policy on a fresh single-env VecEnv with fixed seeds; returns per-episode statistics."""
+    env = make_vec_env(make_env, n_envs=1, env_kwargs={"stage": stage, "easy_episode_prob": 0.0},
+                       vec_env_cls=DummyVecEnv)
     results = []
     for i in range(episodes):
-        obs, _ = env.reset(seed=seed + i)
-        ret, length, speed, done = 0.0, 0, 0.0, False
-        while not done:
+        env.seed(seed + i)  # applied on the next reset
+        obs = env.reset()
+        ret, length, speed = 0.0, 0, 0.0
+        while True:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            ret += reward
+            obs, rewards, dones, infos = env.step(action)
+            ret += float(rewards[0])
             length += 1
-            speed += info["forward_speed"]
-            done = terminated or truncated
+            speed += infos[0]["forward_speed"]
+            if dones[0]:  # the VecEnv has already reset, but infos[0] belongs to the finished episode
+                break
         results.append({
             "return": ret,
             "length": length,
-            "outcome": episode_outcome(info, terminated),
+            "outcome": episode_outcome(infos[0], is_terminated(infos[0])),
             "forward_speed": speed / length * MAX_SPEED,
         })
     env.close()
@@ -207,14 +224,14 @@ def evaluate(model, stage, episodes, seed):
 
 
 class TrainingCallback(BaseCallback):
-    """Called by our SAC after every env step: logs episodes, runs the curriculum, evaluates and saves checkpoints."""
+    """Called by our SAC after every VecEnv step (N_ENVS transitions): logs episodes, runs the curriculum, evaluates and saves checkpoints."""
 
     def __init__(self, model, env, run_dir, stage, final_stage, eval_freq, eval_episodes, save_freq, total):
         super().__init__()
         self.sac, self.env, self.run_dir = model, env, run_dir
         self.stage, self.final_stage = stage, final_stage
         self.eval_freq, self.eval_episodes, self.save_freq, self.total = eval_freq, eval_episodes, save_freq, total
-        self.steps = 0
+        self.steps = 0  # total env steps over all envs (like SB3's num_timesteps)
         self.stage_start = 0
         self.logged_episodes = 0
         self.lengths = deque(maxlen=ADVANCE_EPISODES)
@@ -238,7 +255,8 @@ class TrainingCallback(BaseCallback):
             f.write(str(self.stage))
 
     def _on_step(self):
-        self.steps += 1
+        prev = self.steps
+        self.steps += self.env.num_envs  # one vec step = one step in every env
         while self.logged_episodes < len(self.env.episodes):
             ep = self.env.episodes[self.logged_episodes]
             self.logged_episodes += 1
@@ -246,9 +264,10 @@ class TrainingCallback(BaseCallback):
             self.episodes_csv.writerow([self.logged_episodes, self.steps, self.stage, f"{ep['return']:.3f}",
                                         ep["length"], ep["outcome"], f"{ep['forward_speed']:.3f}"])
         self._curriculum()
-        if self.steps % self.eval_freq == 0 or self.steps == self.total:
+        # steps grows in jumps of N_ENVS, so detect crossing a multiple instead of testing divisibility
+        if self.steps // self.eval_freq > prev // self.eval_freq or self.steps >= self.total:
             self._evaluate()
-        if self.steps % self.save_freq == 0:
+        if self.steps // self.save_freq > prev // self.save_freq:
             self.sac.save(f"{self.run_dir}/checkpoints/model_{self.steps:09d}.pkl")
         return True
 
@@ -261,7 +280,7 @@ class TrainingCallback(BaseCallback):
             self.stage += 1
             self.stage_start = self.steps
             self.lengths.clear()
-            self.env.unwrapped_wrapper.set_stage(self.stage)
+            self.env.env_method("set_stage", self.stage)  # in every subprocess env
             self._write_stage()
             reason = "mastered" if mastered else "time limit"
             self.curriculum_csv.writerow([self.steps, self.stage, STAGES[self.stage]["name"], reason])
@@ -318,10 +337,10 @@ if __name__ == "__main__":
                    "advance_episodes": ADVANCE_EPISODES, "easy_episode_prob": EASY_EPISODE_PROB,
                    "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f, indent=2, default=str)
 
-    wrapper = make_env(stage=args.start_stage)
-    env = EpisodeLogger(wrapper)
-    env.unwrapped_wrapper = wrapper  # used by the curriculum to switch stages
-    env.reset(seed=args.seed)
+    # N_ENVS copies of the env, each in its own process (SB3 VecEnv, auto-reset, wrapped in Monitor)
+    env = make_vec_env(make_env, n_envs=N_ENVS, seed=args.seed, env_kwargs={"stage": args.start_stage},
+                       vec_env_cls=SubprocVecEnv)
+    env = EpisodeLogger(env)
 
     model = SAC("MlpPolicy", env, learning_rate=args.lr, batch_size=args.batch_size,
                 learning_starts=args.learning_starts, ent_coef=args.alpha, seed=args.seed)
