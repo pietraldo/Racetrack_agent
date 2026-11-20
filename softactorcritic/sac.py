@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
+from softactorcritic.buffer import ReplayBuffer
 from softactorcritic.models import Actor, Critic
 
 
@@ -132,7 +133,13 @@ class SAC:
             lr=self.learning_rate
         )
         
-        self.replay_buffer = deque([], maxlen=buffer_size)
+        assert self.env.observation_space.shape is not None
+        assert self.env.action_space.shape is not None
+        self.replay_buffer = ReplayBuffer(
+            self.buffer_size, 
+            self.env.observation_space.shape,
+            self.env.action_space.shape,
+        )
         self.scheduler = Scheduler(
             learning_starts, 
             train_freq, 
@@ -146,17 +153,14 @@ class SAC:
 
     def train(self, gradient_steps, batch_size=64):
         for _ in range(gradient_steps):
-            batch = random.sample(self.replay_buffer, min(batch_size, len(self.replay_buffer)))
-            # obs, actions, rewards, new_obs, dones = \
-            #     [th.as_tensor(lst) for lst in zip(*batch)]
-            
-            obs, actions, rewards, new_obs, dones = zip(*batch)
+            batch_size = min(batch_size, self.replay_buffer.size())
+            obs, actions, rewards, new_obs, dones = self.replay_buffer.sample(batch_size)
 
-            obs      = th.as_tensor(np.stack(obs),      dtype=th.float32)
-            actions  = th.as_tensor(np.stack(actions),  dtype=th.float32)
-            new_obs  = th.as_tensor(np.stack(new_obs),  dtype=th.float32)
-            rewards  = th.as_tensor(rewards, dtype=th.float32).unsqueeze(-1)
-            dones    = th.as_tensor(dones,   dtype=th.float32).unsqueeze(-1)
+            obs = th.as_tensor(obs,      dtype=th.float32)
+            actions = th.as_tensor(actions,  dtype=th.float32)
+            new_obs = th.as_tensor(new_obs,  dtype=th.float32)
+            rewards = th.as_tensor(rewards, dtype=th.float32).unsqueeze(-1)
+            dones = th.as_tensor(dones,   dtype=th.float32).unsqueeze(-1)
             
             # Crtitic gradient step
             with th.no_grad():
@@ -214,7 +218,7 @@ class SAC:
             new_obs, reward, terminated, truncated, _ = self.env.step(scaled_action)
             [c._on_step() for c in callback]
             
-            self.replay_buffer.append((obs, action, reward, new_obs, terminated))
+            self.replay_buffer.append(obs, action, float(reward), new_obs, terminated)
 
             if terminated or truncated:
                 obs, _ = self.env.reset()
@@ -248,7 +252,11 @@ class SAC:
         # because AveragedModel holds a local function that pickle cannot serialize
         state = self.__dict__.copy()
         state["env"] = None
-        state["replay_buffer"] = deque([], maxlen=self.buffer_size)
+        state["replay_buffer"] = ReplayBuffer(
+            self.replay_buffer.capacity,
+            self.replay_buffer.observation_shape,
+            self.replay_buffer.action_shape,
+        )
         state["critic_target"] = self.critic_target.state_dict()
         return state
 
